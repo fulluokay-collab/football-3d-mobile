@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>3D Soccer Prototype — 4D Trails</title>
+<style>
+  html,body { height:100%; margin:0; background:#111; color:#ddd; font-family:system-ui,Segoe UI,Roboto,Arial;}
+  #ui { position: absolute; left: 12px; top: 12px; z-index: 5; display:flex; gap:8px; }
+  button { background:#222;border:1px solid #555;color:#eee;padding:8px 10px;border-radius:6px; cursor:pointer; }
+  #score { position:absolute; right:12px; top:12px; font-weight:700; font-size:18px; }
+  #help { position:absolute; left:12px; bottom:12px; font-size:13px; color:#bbb; }
+  canvas { display:block; }
+  #hud { position:absolute; left:12px; top:60px; color:#fff; opacity:0.9; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <button id="toggle4d">Toggle 4D</button>
+  <button id="switchBtn">Switch Player (Tab)</button>
+  <button id="resetBtn">Reset</button>
+</div>
+<div id="score">Team A <span id="scoreA">0</span> : <span id="scoreB">0</span> Team B</div>
+<div id="hud">Controls: WASD/Arrows move • Space kick • Tab switch</div>
+<div id="help">4D shows time trails (color fades). Camera: drag to orbit, scroll to zoom.</div>
+
+<script type="module">
+// --- Imports from CDN ---
+import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.152.2/examples/jsm/controls/OrbitControls.js';
+
+// ----- Config -----
+const CFG = {
+  width: window.innerWidth,
+  height: window.innerHeight,
+  fieldW: 80,   // meters (visual scale)
+  fieldH: 50,
+  playerRadius: 1.2,
+  ballRadius: 0.6,
+  maxPlayersPerTeam: 5,
+  trailLength: 120, // historical frames to keep for trails
+};
+
+// ----- Scene init -----
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a3320);
+const camera = new THREE.PerspectiveCamera(60, CFG.width / CFG.height, 0.1, 1000);
+camera.position.set(0, 40, 60);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(CFG.width, CFG.height);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0,0,0);
+controls.enableDamping = true;
+
+// Lighting
+const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.7);
+hemi.position.set(0,50,0);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+dir.position.set(-30,50,30);
+dir.castShadow = true;
+dir.shadow.mapSize.width = dir.shadow.mapSize.height = 1024;
+scene.add(dir);
+
+// ----- Field (plane) -----
+const fieldGroup = new THREE.Group();
+const fieldGeo = new THREE.PlaneGeometry(CFG.fieldW, CFG.fieldH);
+const fieldMat = new THREE.MeshStandardMaterial({ color: 0x1f7a36, metalness:0.1, roughness:0.8 });
+const fieldMesh = new THREE.Mesh(fieldGeo, fieldMat);
+fieldMesh.rotation.x = -Math.PI/2;
+fieldMesh.receiveShadow = true;
+fieldGroup.add(fieldMesh);
+
+// white lines (simple)
+const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+const lines = new THREE.Group();
+function addLine(points){
+  const geo = new THREE.BufferGeometry().setFromPoints(points);
+  lines.add(new THREE.Line(geo, lineMat));
+}
+addLine([new THREE.Vector3(-CFG.fieldW/2, 0.01, 0), new THREE.Vector3(CFG.fieldW/2, 0.01, 0)]); // halfway
+// center circle
+const circleGeo = new THREE.CircleGeometry(8, 64);
+circleGeo.vertices = undefined;
+const circleMat = new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, opacity:0.6, transparent:true });
+const circle = new THREE.Mesh(circleGeo, circleMat);
+circle.rotation.x = -Math.PI/2; circle.position.y = 0.02;
+lines.add(circle);
+
+// goals (simple posts)
+function makeGoal(x){
+  const g = new THREE.Group();
+  const postMat = new THREE.MeshStandardMaterial({color:0xffffff});
+  const postGeo = new THREE.BoxGeometry(0.6, 3.6, 0.6);
+  const left = new THREE.Mesh(postGeo, postMat);
+  const right = left.clone();
+  left.position.set(x, 1.8, -3);
+  right.position.set(x, 1.8, 3);
+  const cross = new THREE.Mesh(new THREE.BoxGeometry( Math.abs(x - (x>0? x-0.5:x+0.5)), 0.4, 0.4 ), postMat);
+  cross.position.set(x>0 ? x-0.3 : x+0.3, 3.6/2 + 0.2, 0);
+  g.add(left, right, cross);
+  g.position.y = 0;
+  return g;
+}
+lines.add(makeGoal(-CFG.fieldW/2));
+lines.add(makeGoal(CFG.fieldW/2));
+
+fieldGroup.add(lines);
+scene.add(fieldGroup);
+
+// ----- Objects: players and ball -----
+const teams = [[],[]]; // arrays of player objects
+let players = []; // all players flat
+let controlledIndex = 0;
+let scoreA = 0, scoreB = 0;
+
+const ball = {
+  mesh: null, x:0, y:0, z:0, vx:0, vy:0, vz:0, radius: CFG.ballRadius, history: []
+};
+
+function makePlayerMesh(color){
+  const mat = new THREE.MeshStandardMaterial({ color });
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(CFG.playerRadius, 0.6, 4, 8), mat);
+  body.castShadow = true;
+  return body;
+}
+
+// initialize players and ball positions
+function initMatch(){
+  // clear existing
+  players.forEach(p => { if(p.mesh) scene.remove(p.mesh); });
+  players = []; teams[0]=[]; teams[1]=[];
+  // spawn positions (left team A, right team B)
+  const leftX = -CFG.fieldW/4, rightX = CFG.fieldW/4;
+  const midZ = 0; const spacing = 7;
+  for(let t=0;t<2;t++){
+    for(let i=0;i<CFG.maxPlayersPerTeam;i++){
+      const color = t===0 ? 0xe63b3b : 0x2b9eff;
+      const mesh = makePlayerMesh(color);
+      scene.add(mesh);
+      const p = {
+        id: players.length,
+        team: t,
+        mesh,
+        x: (t===0? leftX : rightX) + (Math.random()-0.5)*6,
+        y: 0.9,
+        z: (i - Math.floor(CFG.maxPlayersPerTeam/2)) * spacing + (Math.random()-0.5)*2,
+        vx:0, vy:0, vz:0,
+        speed: 0.25 + Math.random() * 0.12,
+        isControlled: t===0 && i===0,
+        history: [] // for trails
+      };
+      mesh.position.set(p.x, p.y, p.z);
+      players.push(p);
+      teams[t].push(p);
+    }
+  }
+  controlledIndex = players.findIndex(p => p.isControlled);
+  resetBall(true);
+  updateScoreUI();
+}
+function resetBall(center=false){
+  ball.vx = ball.vy = ball.vz = 0;
+  ball.history = [];
+  if(center){
+    ball.x = 0; ball.z = 0; ball.y = ball.radius;
+  } else {
+    ball.x = (Math.random()-0.5)*4;
+    ball.z = (Math.random()-0.5)*8;
+    ball.y = ball.radius;
+  }
+  if(!ball.mesh){
+    const geo = new THREE.SphereGeometry(ball.radius, 24, 24);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xffffaa, metalness:0.3, roughness:0.4 });
+    ball.mesh = new THREE.Mesh(geo, mat);
+    ball.mesh.castShadow = true;
+    scene.add(ball.mesh);
+  }
+  ball.mesh.position.set(ball.x, ball.y, ball.z);
+}
+
+// ----- Input -----
+const input = { up:false, down:false, left:false, right:false, kick:false, switch:false };
+window.addEventListener('keydown', e=>{
+  if(e.key==='ArrowUp'||e.key==='w'||e.key==='W') input.up = true;
+  if(e.key==='ArrowDown'||e.key==='s'||e.key==='S') input.down = true;
+  if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') input.left = true;
+  if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') input.right = true;
+  if(e.code==='Space') input.kick = true;
+  if(e.key==='Tab'){ e.preventDefault(); input.switch = true; }
+});
+window.addEventListener('keyup', e=>{
+  if(e.key==='ArrowUp'||e.key==='w'||e.key==='W') input.up = false;
+  if(e.key==='ArrowDown'||e.key==='s'||e.key==='S') input.down = false;
+  if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') input.left = false;
+  if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') input.right = false;
+  if(e.code==='Space') input.kick = false;
+  if(e.key==='Tab') input.switch = false;
+});
+
+// UI buttons
+const toggle4dBtn = document.getElementById('toggle4d');
+const switchBtn = document.getElementById('switchBtn');
+const resetBtn = document.getElementById('resetBtn');
+toggle4dBtn.addEventListener('click', () => { enable4D = !enable4D; updateTrailVisibility(); });
+switchBtn.addEventListener('click', () => { doSwitch(); });
+resetBtn.addEventListener('click', () => { scoreA=scoreB=0; initMatch(); });
+
+// score UI
+const scoreAElem = document.getElementById('scoreA');
+const scoreBElem = document.getElementById('scoreB');
+function updateScoreUI(){ scoreAElem.textContent = scoreA; scoreBElem.textContent = scoreB; }
+
+// ----- Trails (4D) -----
+let enable4D = true;
+const playerTrails = []; // THREE.Line objects per player
+let ballTrail = null;
+function makeTrail(length, color){
+  const positions = new Float32Array(length * 3);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const mat = new THREE.LineBasicMaterial({ color, transparent:true, opacity:0.9 });
+  const line = new THREE.Line(geo, mat);
+  line.frustumCulled = false;
+  scene.add(line);
+  return line;
+}
+function updateTrailVisibility(){
+  playerTrails.forEach(t => t.visible = enable4D);
+  if(ballTrail) ballTrail.visible = enable4D;
+}
+
+// create trail objects
+function ensureTrails(){
+  // players
+  while(playerTrails.length < players.length){
+    const t = makeTrail(CFG.trailLength, 0xffffff);
+    playerTrails.push(t);
+  }
+  // ball
+  if(!ballTrail) ballTrail = makeTrail(CFG.trailLength, 0xffd070);
+  updateTrailVisibility();
+}
+
+// ----- Game logic (simple) -----
+function doSwitch(){
+  const current = players[controlledIndex];
+  const team = current.team;
+  const indices = players.map((p,i)=>({p,i})).filter(pi => pi.p.team===team).map(pi=>pi.i);
+  const pos = indices.indexOf(controlledIndex);
+  const next = indices[(pos+1)%indices.length];
+  players[controlledIndex].isControlled = false;
+  controlledIndex = next;
+  players[controlledIndex].isControlled = true;
+}
+
+// physics/time step
+const dt = 1/60;
+function step(){
+  // handle switch input (Tab)
+  if(input.switch){ doSwitch(); input.switch=false; }
+
+  // controlled player movement
+  const ctrl = players[controlledIndex];
+  let mx = 0, mz = 0;
+  if(input.up) mz -= 1;
+  if(input.down) mz += 1;
+  if(input.left) mx -= 1;
+  if(input.right) mx += 1;
+  // normalize
+  const mag = Math.hypot(mx, mz) || 1;
+  ctrl.vx += (mx/mag) * ctrl.speed;
+  ctrl.vz += (mz/mag) * ctrl.speed;
+
+  // kick if near ball
+  if(input.kick && dist2D(ctrl.x, ctrl.z, ball.x, ball.z) < 3.0){
+    // kick direction: forward relative to camera view
+    const aimX = (camera.position.x - ctrl.x);
+    const aimZ = (camera.position.z - ctrl.z);
+    const aim = normalize2D({x: -aimX, z: -aimZ});
+    const power = 6 + Math.random()*2;
+    ball.vx = aim.x * power + ctrl.vx*0.2;
+    ball.vz = aim.z * power + ctrl.vz*0.2;
+    ball.vy = 1.5; // small bounce
+    input.kick = false; // single kick
+  }
+
+  // simple AI for non-controlled players
+  for(let p of players){
+    if(!p.isControlled){
+      simpleAI3D(p);
+    }
+  }
+
+  // integrate players, apply damping
+  for(let p of players){
+    p.vx *= 0.9; p.vz *= 0.9;
+    p.x += p.vx;
+    p.z += p.vz;
+    // keep in field bounds
+    p.x = clamp(p.x, -CFG.fieldW/2 + 1.5, CFG.fieldW/2 - 1.5);
+    p.z = clamp(p.z, -CFG.fieldH/2 + 1.5, CFG.fieldH/2 - 1.5);
+    p.mesh.position.set(p.x, p.y, p.z);
+    // record history
+    p.history.push({x:p.x,y:p.y,z:p.z});
+    if(p.history.length > CFG.trailLength) p.history.shift();
+  }
+
+  // ball physics
+  ball.vy -= 9.8 * dt * 0.6; // gravity
+  ball.vx *= 0.995; ball.vz *= 0.995; ball.vy *= 0.995;
+  ball.x += ball.vx * dt * 60;
+  ball.y += ball.vy * dt * 60;
+  ball.z += ball.vz * dt * 60;
+
+  // ground collision
+  if(ball.y < ball.radius){
+    ball.y = ball.radius;
+    if(ball.vy < 0) ball.vy *= -0.45;
+    // friction on ground
+    ball.vx *= 0.98; ball.vz *= 0.98;
+  }
+
+  // collide with players (simple)
+  for(let p of players){
+    const d = dist2D(p.x,p.z,ball.x,ball.z);
+    const minD = CFG.playerRadius + ball.radius;
+    if(d < minD){
+      // push ball away
+      const nx = (ball.x - p.x) / Math.max(d,0.01);
+      const nz = (ball.z - p.z) / Math.max(d,0.01);
+      ball.vx = nx * 4 + p.vx*0.5;
+      ball.vz = nz * 4 + p.vz*0.5;
+      ball.vy = 1.2;
+      // small recoil to player
+      p.vx -= nx*0.3; p.vz -= nz*0.3;
+    }
+  }
+
+  // field bounds for ball (reflect)
+  const boundX = CFG.fieldW/2 - 1;
+  const boundZ = CFG.fieldH/2 - 1;
+  if(ball.x < -boundX){ // left goal area check
+    // simple goal detection: z within goal height (~3) centered
+    if(Math.abs(ball.z) < 3.5){
+      // goal for team B (right)
+      scoreB++; updateScoreUI(); initMatch();
+      return;
+    } else { ball.x = -boundX; ball.vx *= -0.6; }
+  }
+  if(ball.x > boundX){
+    if(Math.abs(ball.z) < 3.5){
+      // goal for team A (left)
+      scoreA++; updateScoreUI(); initMatch();
+      return;
+    } else { ball.x = boundX; ball.vx *= -0.6; }
+  }
+  if(ball.z < -boundZ){ ball.z = -boundZ; ball.vz *= -0.6; }
+  if(ball.z > boundZ){ ball.z = boundZ; ball.vz *= -0.6; }
+
+  // update ball mesh
+  if(ball.mesh) ball.mesh.position.set(ball.x, ball.y, ball.z);
+  // record ball history
+  ball.history.push({x:ball.x,y:ball.y,z:ball.z});
+  if(ball.history.length > CFG.trailLength) ball.history.shift();
+
+  // update trails
+  updateTrails();
+}
+
+// simple AI behavior: chase ball if nearby, else support
+function simpleAI3D(p){
+  // find nearest threats/opponents
+  const dToBall = dist2D(p.x,p.z,ball.x,ball.z);
+  if(dToBall < 12){
+    // close: chase to contest
+    const dir = normalize2D({x: ball.x - p.x, z: ball.z - p.z});
+    p.vx += dir.x * p.speed * 0.9;
+    p.vz += dir.z * p.speed * 0.9;
+  } else {
+    // support: position between ball and opponent goal
+    const goalX = p.team===0 ? CFG.fieldW/2 : -CFG.fieldW/2;
+    const desired = { x: (ball.x + goalX) * 0.45 + (Math.random()-0.5)*2, z: ball.z + (Math.random()-0.5)*5 };
+    const dir = normalize2D({x: desired.x - p.x, z: desired.z - p.z});
+    p.vx += dir.x * p.speed * 0.5;
+    p.vz += dir.z * p.speed * 0.5;
+  }
+}
+
+// update trail geometries from history arrays
+function updateTrails(){
+  ensureTrails();
+  // players
+  for(let i=0;i<players.length;i++){
+    const p = players[i];
+    const line = playerTrails[i];
+    const posAttr = line.geometry.attributes.position;
+    const len = posAttr.count;
+    // fill with history (older at low indices)
+    for(let j=0;j<len;j++){
+      const idx = Math.max(0, p.history.length - len + j);
+      const h = p.history[idx] || p.history[0] || {x:p.x,y:p.y,z:p.z};
+      posAttr.setXYZ(j, h.x, h.y+0.1, h.z);
+    }
+    posAttr.needsUpdate = true;
+    // fade by adjusting material opacity proportional to trail length
+    line.material.opacity = 0.9;
+    line.material.color.setHex(p.team===0 ? 0xffb3b3 : 0xb3e0ff);
+    line.visible = enable4D;
+  }
+  // ball
+  const bLine = ballTrail;
+  const bPos = bLine.geometry.attributes.position;
+  const len = bPos.count;
+  for(let j=0;j<len;j++){
+    const idx = Math.max(0, ball.history.length - len + j);
+    const h = ball.history[idx] || ball.history[0] || {x:ball.x,y:ball.y,z:ball.z};
+    bPos.setXYZ(j, h.x, h.y, h.z);
+  }
+  bPos.needsUpdate = true;
+  // set ball trail color and visibility
+  bLine.material.opacity = 0.95;
+  bLine.visible = enable4D;
+}
+
+// ----- Helpers -----
+function dist2D(x1,z1,x2,z2){ return Math.hypot(x1-x2, z1-z2); }
+function normalize2D(v){ const m = Math.hypot(v.x||0, v.z||0) || 1; return { x:(v.x||0)/m, z:(v.z||0)/m }; }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+// ----- Render loop -----
+let last = performance.now();
+function animate(){
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  // fixed-step update
+  step();
+  controls.update();
+  // camera follow controlled player (gentle)
+  const c = players[controlledIndex];
+  if(c){
+    // smoothly move camera target
+    controls.target.lerp(new THREE.Vector3(c.x, 0.8, c.z), 0.08);
+    // optionally keep camera above the field
+  }
+  renderer.render(scene, camera);
+}
+initMatch();
+ensureTrails();
+animate();
+
+// resize handling
+window.addEventListener('resize', ()=>{
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// init trails visibility
+updateTrailVisibility();
+
+// keyboard helper for switching (Tab)
+window.addEventListener('keydown', e=>{
+  if(e.key === 'Tab'){ e.preventDefault(); doSwitch(); }
+});
+</script>
+</body>
+</html>
